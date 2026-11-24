@@ -1,0 +1,1455 @@
+
+
+# ========================= 1. CONFIGURATION =========================
+
+import os
+import time
+import random
+import json
+import zipfile
+import copy
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from pathlib import Path
+from contextlib import nullcontext
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+
+import torchvision
+import torchvision.transforms as transforms
+import torchvision.datasets as datasets
+
+from torchvision.models import (
+    resnet18,
+    mobilenet_v2,
+    ResNet18_Weights,
+    MobileNet_V2_Weights
+)
+
+from torch.utils.data import DataLoader, Subset
+
+from sklearn.metrics import (
+    classification_report,
+    confusion_matrix,
+    ConfusionMatrixDisplay
+)
+
+warnings.filterwarnings("ignore")
+
+# -------- USER CONFIGURATION --------
+
+# Choose model: "resnet18" or "mobilenet_v2"
+MODEL_NAME = "resnet18"
+
+# Choose datasets:
+# ["CIFAR10"]
+# ["CIFAR100"]
+# ["EuroSAT"]
+# ["CIFAR10", "CIFAR100"]
+# ["CIFAR10", "CIFAR100", "EuroSAT"]
+
+DATASETS_TO_RUN = ["CIFAR10"]
+
+# Number of training epochs
+EPOCHS = 10
+
+# Batch size
+BATCH_SIZE = 64
+
+# Number of repeated experimental runs
+# For final research, consider [42, 123, 2026]
+SEEDS = [42]
+
+# Number of data loading workers
+NUM_WORKERS = 2
+
+# Image size
+IMAGE_SIZE = 224
+
+# Learning rates
+SCRATCH_LR = 0.001
+HEAD_LR = 0.001
+BACKBONE_LR = 0.0001
+
+# Weight decay
+WEIGHT_DECAY = 0.0001
+
+# Target validation accuracy (example starting thresholds)
+TARGET_ACCURACY = {
+    "CIFAR10": 70.0,
+    "CIFAR100": 40.0,
+    "EuroSAT": 80.0
+}
+
+# Save trained model checkpoints
+SAVE_CHECKPOINTS = False
+
+# Automatically download result ZIP at the end
+DOWNLOAD_RESULTS = True
+
+# Output folder
+RESULTS_DIR = "/content/transfer_learning_results"
+os.makedirs(RESULTS_DIR, exist_ok=True)
+
+# GPU / CPU selection
+DEVICE = torch.device(
+    "cuda" if torch.cuda.is_available() else "cpu"
+)
+
+USE_AMP = DEVICE.type == "cuda"
+
+print("=" * 65)
+print("TRANSFER LEARNING EXPERIMENT")
+print("=" * 65)
+print("Device:", DEVICE)
+print("GPU:", torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU")
+print("PyTorch:", torch.__version__)
+print("Torchvision:", torchvision.__version__)
+print("Model:", MODEL_NAME)
+print("Datasets:", DATASETS_TO_RUN)
+print("Epochs:", EPOCHS)
+print("Batch size:", BATCH_SIZE)
+print("=" * 65)
+
+
+# ========================= 2. REPRODUCIBILITY =========================
+
+def set_seed(seed):
+
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# ========================= 3. IMAGE TRANSFORMS =========================
+
+# ImageNet normalization for pretrained architectures.
+# All three experimental approaches use identical preprocessing.
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+
+train_transform = transforms.Compose([
+
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+
+    transforms.RandomHorizontalFlip(),
+
+    transforms.RandomRotation(10),
+
+    transforms.ToTensor(),
+
+    transforms.Normalize(
+        mean=IMAGENET_MEAN,
+        std=IMAGENET_STD
+    )
+
+])
+
+test_transform = transforms.Compose([
+
+    transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+
+    transforms.ToTensor(),
+
+    transforms.Normalize(
+        mean=IMAGENET_MEAN,
+        std=IMAGENET_STD
+    )
+
+])
+
+
+# ========================= 4. DATASET PREPARATION =========================
+
+def prepare_dataset(dataset_name, seed):
+
+    root = "/content/datasets"
+
+    generator = torch.Generator().manual_seed(seed)
+
+    if dataset_name == "CIFAR10":
+
+        train_aug = datasets.CIFAR10(
+            root=root,
+            train=True,
+            download=True,
+            transform=train_transform
+        )
+
+        train_eval = datasets.CIFAR10(
+            root=root,
+            train=True,
+            download=True,
+            transform=test_transform
+        )
+
+        test_data = datasets.CIFAR10(
+            root=root,
+            train=False,
+            download=True,
+            transform=test_transform
+        )
+
+        class_names = train_aug.classes
+
+        n = len(train_aug)
+        indices = torch.randperm(n, generator=generator).tolist()
+
+        split = int(0.9 * n)
+
+        train_data = Subset(
+            train_aug,
+            indices[:split]
+        )
+
+        val_data = Subset(
+            train_eval,
+            indices[split:]
+        )
+
+    elif dataset_name == "CIFAR100":
+
+        train_aug = datasets.CIFAR100(
+            root=root,
+            train=True,
+            download=True,
+            transform=train_transform
+        )
+
+        train_eval = datasets.CIFAR100(
+            root=root,
+            train=True,
+            download=True,
+            transform=test_transform
+        )
+
+        test_data = datasets.CIFAR100(
+            root=root,
+            train=False,
+            download=True,
+            transform=test_transform
+        )
+
+        class_names = train_aug.classes
+
+        n = len(train_aug)
+        indices = torch.randperm(n, generator=generator).tolist()
+
+        split = int(0.9 * n)
+
+        train_data = Subset(
+            train_aug,
+            indices[:split]
+        )
+
+        val_data = Subset(
+            train_eval,
+            indices[split:]
+        )
+
+    elif dataset_name == "EuroSAT":
+
+        train_aug = datasets.EuroSAT(
+            root=root,
+            download=True,
+            transform=train_transform
+        )
+
+        train_eval = datasets.EuroSAT(
+            root=root,
+            download=True,
+            transform=test_transform
+        )
+
+        class_names = train_aug.classes
+
+        n = len(train_aug)
+
+        indices = torch.randperm(
+            n,
+            generator=generator
+        ).tolist()
+
+        train_end = int(0.70 * n)
+        val_end = int(0.85 * n)
+
+        train_data = Subset(
+            train_aug,
+            indices[:train_end]
+        )
+
+        val_data = Subset(
+            train_eval,
+            indices[train_end:val_end]
+        )
+
+        test_data = Subset(
+            train_eval,
+            indices[val_end:]
+        )
+
+    else:
+
+        raise ValueError("Unsupported dataset")
+
+    return train_data, val_data, test_data, class_names
+
+
+# ========================= 5. DATA LOADERS =========================
+
+def create_loaders(dataset_name, seed):
+
+    train_data, val_data, test_data, class_names = prepare_dataset(
+        dataset_name,
+        seed
+    )
+
+    generator = torch.Generator().manual_seed(seed)
+
+    common = {
+        "num_workers": NUM_WORKERS,
+        "pin_memory": DEVICE.type == "cuda"
+    }
+
+    train_loader = DataLoader(
+        train_data,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        generator=generator,
+        **common
+    )
+
+    val_loader = DataLoader(
+        val_data,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        **common
+    )
+
+    test_loader = DataLoader(
+        test_data,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        **common
+    )
+
+    print("\nDataset:", dataset_name)
+    print("Classes:", len(class_names))
+    print("Training images:", len(train_data))
+    print("Validation images:", len(val_data))
+    print("Testing images:", len(test_data))
+
+    return train_loader, val_loader, test_loader, class_names
+
+
+# ========================= 6. MODEL ARCHITECTURE =========================
+
+def build_model(method, number_of_classes):
+
+    pretrained = method != "scratch"
+
+    if MODEL_NAME == "resnet18":
+
+        weights = (
+            ResNet18_Weights.DEFAULT
+            if pretrained else None
+        )
+
+        model = resnet18(weights=weights)
+
+        input_features = model.fc.in_features
+
+        model.fc = nn.Linear(
+            input_features,
+            number_of_classes
+        )
+
+        head_prefix = "fc"
+
+    elif MODEL_NAME == "mobilenet_v2":
+
+        weights = (
+            MobileNet_V2_Weights.DEFAULT
+            if pretrained else None
+        )
+
+        model = mobilenet_v2(weights=weights)
+
+        input_features = model.last_channel
+
+        model.classifier[1] = nn.Linear(
+            input_features,
+            number_of_classes
+        )
+
+        head_prefix = "classifier"
+
+    else:
+
+        raise ValueError("Invalid model architecture")
+
+    # Freeze all backbone layers for feature extraction.
+    if method == "feature_extraction":
+
+        for parameter in model.parameters():
+            parameter.requires_grad = False
+
+        for parameter in getattr(
+            model,
+            head_prefix
+        ).parameters():
+
+            parameter.requires_grad = True
+
+    # Entire pretrained network is trainable for fine-tuning.
+    elif method == "fine_tuning":
+
+        for parameter in model.parameters():
+            parameter.requires_grad = True
+
+    # All layers are trainable when training from scratch.
+    elif method == "scratch":
+
+        for parameter in model.parameters():
+            parameter.requires_grad = True
+
+    model = model.to(DEVICE)
+
+    return model, head_prefix
+
+
+# ========================= 7. OPTIMIZER =========================
+
+def create_optimizer(model, method, head_prefix):
+
+    head_parameters = list(
+        getattr(model, head_prefix).parameters()
+    )
+
+    head_ids = {
+        id(parameter)
+        for parameter in head_parameters
+    }
+
+    backbone_parameters = [
+        parameter
+        for parameter in model.parameters()
+        if parameter.requires_grad
+        and id(parameter) not in head_ids
+    ]
+
+    if method == "scratch":
+
+        optimizer = optim.AdamW(
+            model.parameters(),
+            lr=SCRATCH_LR,
+            weight_decay=WEIGHT_DECAY
+        )
+
+    elif method == "feature_extraction":
+
+        optimizer = optim.AdamW(
+            head_parameters,
+            lr=HEAD_LR,
+            weight_decay=WEIGHT_DECAY
+        )
+
+    else:
+
+        optimizer = optim.AdamW(
+            [
+                {
+                    "params": backbone_parameters,
+                    "lr": BACKBONE_LR
+                },
+                {
+                    "params": head_parameters,
+                    "lr": HEAD_LR
+                }
+            ],
+            weight_decay=WEIGHT_DECAY
+        )
+
+    return optimizer
+
+
+# ========================= 8. TRAINING FUNCTION =========================
+
+def train_one_epoch(
+    model,
+    loader,
+    criterion,
+    optimizer,
+    scaler
+):
+
+    model.train()
+
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    start = time.perf_counter()
+
+    for images, labels in loader:
+
+        images = images.to(
+            DEVICE,
+            non_blocking=True
+        )
+
+        labels = labels.to(
+            DEVICE,
+            non_blocking=True
+        )
+
+        optimizer.zero_grad(set_to_none=True)
+
+        context = (
+            torch.autocast(
+                device_type="cuda",
+                dtype=torch.float16
+            )
+            if USE_AMP
+            else nullcontext()
+        )
+
+        with context:
+
+            outputs = model(images)
+
+            loss = criterion(
+                outputs,
+                labels
+            )
+
+        scaler.scale(loss).backward()
+
+        scaler.step(optimizer)
+
+        scaler.update()
+
+        running_loss += loss.item() * images.size(0)
+
+        predictions = torch.argmax(
+            outputs,
+            dim=1
+        )
+
+        correct += (
+            predictions == labels
+        ).sum().item()
+
+        total += labels.size(0)
+
+    if DEVICE.type == "cuda":
+        torch.cuda.synchronize()
+
+    epoch_time = time.perf_counter() - start
+
+    average_loss = running_loss / total
+
+    accuracy = 100.0 * correct / total
+
+    return average_loss, accuracy, epoch_time
+
+
+# ========================= 9. EVALUATION FUNCTION =========================
+
+def evaluate_model(
+    model,
+    loader,
+    criterion,
+    collect_predictions=False
+):
+
+    model.eval()
+
+    running_loss = 0.0
+    correct = 0
+    total = 0
+
+    all_predictions = []
+    all_labels = []
+
+    with torch.no_grad():
+
+        for images, labels in loader:
+
+            images = images.to(
+                DEVICE,
+                non_blocking=True
+            )
+
+            labels = labels.to(
+                DEVICE,
+                non_blocking=True
+            )
+
+            context = (
+                torch.autocast(
+                    device_type="cuda",
+                    dtype=torch.float16
+                )
+                if USE_AMP
+                else nullcontext()
+            )
+
+            with context:
+
+                outputs = model(images)
+
+                loss = criterion(
+                    outputs,
+                    labels
+                )
+
+            predictions = torch.argmax(
+                outputs,
+                dim=1
+            )
+
+            running_loss += (
+                loss.item() * images.size(0)
+            )
+
+            correct += (
+                predictions == labels
+            ).sum().item()
+
+            total += labels.size(0)
+
+            if collect_predictions:
+
+                all_predictions.extend(
+                    predictions.cpu().numpy()
+                )
+
+                all_labels.extend(
+                    labels.cpu().numpy()
+                )
+
+    average_loss = running_loss / total
+
+    accuracy = 100.0 * correct / total
+
+    if collect_predictions:
+
+        return (
+            average_loss,
+            accuracy,
+            np.array(all_labels),
+            np.array(all_predictions)
+        )
+
+    return average_loss, accuracy
+
+
+# ========================= 10. EXPERIMENT EXECUTION =========================
+
+METHODS = [
+    "scratch",
+    "feature_extraction",
+    "fine_tuning"
+]
+
+METHOD_LABELS = {
+    "scratch": "Training from Scratch",
+    "feature_extraction": "Transfer Learning",
+    "fine_tuning": "Fine-Tuning"
+}
+
+all_histories = {}
+summary_rows = []
+
+def run_experiment(dataset_name, method, seed):
+
+    print("\n" + "=" * 65)
+
+    print("DATASET:", dataset_name)
+    print("METHOD:", METHOD_LABELS[method])
+    print("SEED:", seed)
+
+    print("=" * 65)
+
+    set_seed(seed)
+
+    # Prepare data
+    train_loader, val_loader, test_loader, class_names = (
+        create_loaders(dataset_name, seed)
+    )
+
+    number_of_classes = len(class_names)
+
+    # Build model
+    model, head_prefix = build_model(
+        method,
+        number_of_classes
+    )
+
+    trainable_parameters = sum(
+        p.numel()
+        for p in model.parameters()
+        if p.requires_grad
+    )
+
+    total_parameters = sum(
+        p.numel()
+        for p in model.parameters()
+    )
+
+    print("\nTotal parameters:", f"{total_parameters:,}")
+
+    print(
+        "Trainable parameters:",
+        f"{trainable_parameters:,}"
+    )
+
+    # Loss function
+    criterion = nn.CrossEntropyLoss()
+
+    # Optimizer
+    optimizer = create_optimizer(
+        model,
+        method,
+        head_prefix
+    )
+
+    # Learning rate scheduler
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=EPOCHS
+    )
+
+    scaler = torch.amp.GradScaler(
+        "cuda",
+        enabled=USE_AMP
+    )
+
+    # Reset GPU memory statistics
+    if torch.cuda.is_available():
+
+        torch.cuda.empty_cache()
+
+        torch.cuda.reset_peak_memory_stats()
+
+    history = {
+        "train_loss": [],
+        "train_accuracy": [],
+        "val_loss": [],
+        "val_accuracy": [],
+        "epoch_time": [],
+        "elapsed_time": []
+    }
+
+    target = TARGET_ACCURACY[dataset_name]
+
+    time_to_target = None
+
+    cumulative_training_time = 0.0
+
+    experiment_start = time.perf_counter()
+
+    # ---------------- TRAINING LOOP ----------------
+
+    for epoch in range(EPOCHS):
+
+        train_loss, train_acc, epoch_time = train_one_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            scaler
+        )
+
+        val_loss, val_acc = evaluate_model(
+            model,
+            val_loader,
+            criterion
+        )
+
+        scheduler.step()
+
+        cumulative_training_time += epoch_time
+
+        elapsed = time.perf_counter() - experiment_start
+
+        history["train_loss"].append(train_loss)
+        history["train_accuracy"].append(train_acc)
+
+        history["val_loss"].append(val_loss)
+        history["val_accuracy"].append(val_acc)
+
+        history["epoch_time"].append(epoch_time)
+        history["elapsed_time"].append(elapsed)
+
+        if time_to_target is None and val_acc >= target:
+
+            time_to_target = elapsed
+
+        print(
+            f"Epoch [{epoch+1}/{EPOCHS}] | "
+            f"Train Loss: {train_loss:.4f} | "
+            f"Train Accuracy: {train_acc:.2f}% | "
+            f"Val Loss: {val_loss:.4f} | "
+            f"Val Accuracy: {val_acc:.2f}% | "
+            f"Time: {epoch_time:.2f}s"
+        )
+
+        # Save checkpoint if enabled
+        if SAVE_CHECKPOINTS:
+
+            checkpoint_path = os.path.join(
+                RESULTS_DIR,
+                f"{dataset_name}_{method}_seed{seed}_epoch{epoch+1}.pth"
+            )
+
+            torch.save(
+                model.state_dict(),
+                checkpoint_path
+            )
+
+        # Store epoch history
+        all_histories[
+            (dataset_name, method, seed)
+        ] = history
+
+        # Save intermediate history
+        pd.DataFrame(history).to_csv(
+            os.path.join(
+                RESULTS_DIR,
+                f"{dataset_name}_{method}_seed{seed}_history.csv"
+            ),
+            index=False
+        )
+
+    # ---------------- FINAL TEST EVALUATION ----------------
+
+    test_loss, test_acc, y_true, y_pred = evaluate_model(
+        model,
+        test_loader,
+        criterion,
+        collect_predictions=True
+    )
+
+    # GPU memory
+    if torch.cuda.is_available():
+
+        peak_allocated = (
+            torch.cuda.max_memory_allocated() / (1024 ** 3)
+        )
+
+        peak_reserved = (
+            torch.cuda.max_memory_reserved() / (1024 ** 3)
+        )
+
+    else:
+
+        peak_allocated = np.nan
+        peak_reserved = np.nan
+
+    # Classification report
+    report = classification_report(
+        y_true,
+        y_pred,
+        labels=list(range(number_of_classes)),
+        target_names=class_names,
+        output_dict=True,
+        zero_division=0
+    )
+
+    report_df = pd.DataFrame(report).transpose()
+
+    report_df.to_csv(
+        os.path.join(
+            RESULTS_DIR,
+            f"{dataset_name}_{method}_seed{seed}_classification_report.csv"
+        )
+    )
+
+    # Confusion matrix
+    cm = confusion_matrix(
+        y_true,
+        y_pred,
+        labels=list(range(number_of_classes))
+    )
+
+    if number_of_classes <= 20:
+
+        fig, ax = plt.subplots(figsize=(10, 8))
+
+        display = ConfusionMatrixDisplay(
+            confusion_matrix=cm,
+            display_labels=class_names
+        )
+
+        display.plot(
+            ax=ax,
+            cmap="Blues",
+            xticks_rotation=45,
+            colorbar=False
+        )
+
+        plt.title(
+            f"{dataset_name} - {METHOD_LABELS[method]}"
+        )
+
+        plt.tight_layout()
+
+        plt.savefig(
+            os.path.join(
+                RESULTS_DIR,
+                f"{dataset_name}_{method}_seed{seed}_confusion_matrix.png"
+            ),
+            dpi=200
+        )
+
+        plt.close()
+
+    # Final results
+    result = {
+
+        "Dataset": dataset_name,
+
+        "Model": MODEL_NAME,
+
+        "Method": METHOD_LABELS[method],
+
+        "Seed": seed,
+
+        "Test Accuracy (%)": test_acc,
+
+        "Validation Accuracy (%)": history["val_accuracy"][-1],
+
+        "Test Loss": test_loss,
+
+        "Training Time (seconds)": cumulative_training_time,
+
+        "Training Time (minutes)": cumulative_training_time / 60,
+
+        "Time to Target (seconds)": (
+            time_to_target
+            if time_to_target is not None
+            else np.nan
+        ),
+
+        "Target Accuracy (%)": target,
+
+        "Target Reached": (
+            time_to_target is not None
+        ),
+
+        "Peak GPU Memory Allocated (GB)": peak_allocated,
+
+        "Peak GPU Memory Reserved (GB)": peak_reserved,
+
+        "Trainable Parameters": trainable_parameters,
+
+        "Total Parameters": total_parameters
+
+    }
+
+    print("\nFINAL EXPERIMENT RESULTS")
+
+    for key, value in result.items():
+
+        print(f"{key}: {value}")
+
+    summary_rows.append(result)
+
+    # Save final model if enabled
+    if SAVE_CHECKPOINTS:
+
+        torch.save(
+            model.state_dict(),
+            os.path.join(
+                RESULTS_DIR,
+                f"{dataset_name}_{method}_seed{seed}_final.pth"
+            )
+        )
+
+    del model
+    del optimizer
+    del train_loader
+    del val_loader
+    del test_loader
+
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+    return result
+
+
+# ========================= 11. RUN ALL EXPERIMENTS =========================
+
+for dataset_name in DATASETS_TO_RUN:
+
+    for seed in SEEDS:
+
+        for method in METHODS:
+
+            run_experiment(
+                dataset_name,
+                method,
+                seed
+            )
+
+
+# ========================= 12. RESULTS TABLE =========================
+
+summary_df = pd.DataFrame(summary_rows)
+
+summary_path = os.path.join(
+    RESULTS_DIR,
+    "complete_experimental_results.csv"
+)
+
+summary_df.to_csv(
+    summary_path,
+    index=False
+)
+
+print("\n" + "=" * 80)
+print("COMPLETE EXPERIMENTAL RESULTS")
+print("=" * 80)
+
+display(summary_df.round(4))
+
+
+# ========================= 13. AVERAGE RESULTS =========================
+
+average_results = summary_df.groupby(
+    ["Dataset", "Method"],
+    as_index=False
+).agg({
+
+    "Test Accuracy (%)": "mean",
+
+    "Validation Accuracy (%)": "mean",
+
+    "Test Loss": "mean",
+
+    "Training Time (seconds)": "mean",
+
+    "Training Time (minutes)": "mean",
+
+    "Time to Target (seconds)": "mean",
+
+    "Peak GPU Memory Allocated (GB)": "mean",
+
+    "Peak GPU Memory Reserved (GB)": "mean"
+
+})
+
+average_results.to_csv(
+    os.path.join(
+        RESULTS_DIR,
+        "average_experimental_results.csv"
+    ),
+    index=False
+)
+
+print("\nAVERAGE EXPERIMENTAL RESULTS")
+
+display(average_results.round(4))
+
+
+# ========================= 14. TRAINING CURVES =========================
+
+for dataset_name in DATASETS_TO_RUN:
+
+    available_methods = [
+        method
+        for method in METHODS
+        if any(
+            key[0] == dataset_name and key[1] == method
+            for key in all_histories
+        )
+    ]
+
+    fig, axes = plt.subplots(
+        1, 2,
+        figsize=(15, 5)
+    )
+
+    for method in available_methods:
+
+        matching_histories = [
+            history
+            for key, history in all_histories.items()
+            if key[0] == dataset_name and key[1] == method
+        ]
+
+        max_epochs = min(
+            len(h["train_accuracy"])
+            for h in matching_histories
+        )
+
+        train_acc = np.mean(
+            [
+                h["train_accuracy"][:max_epochs]
+                for h in matching_histories
+            ],
+            axis=0
+        )
+
+        val_acc = np.mean(
+            [
+                h["val_accuracy"][:max_epochs]
+                for h in matching_histories
+            ],
+            axis=0
+        )
+
+        train_loss = np.mean(
+            [
+                h["train_loss"][:max_epochs]
+                for h in matching_histories
+            ],
+            axis=0
+        )
+
+        val_loss = np.mean(
+            [
+                h["val_loss"][:max_epochs]
+                for h in matching_histories
+            ],
+            axis=0
+        )
+
+        epochs = range(1, max_epochs + 1)
+
+        axes[0].plot(
+            epochs,
+            train_acc,
+            marker="o",
+            label=f"{METHOD_LABELS[method]} - Train"
+        )
+
+        axes[0].plot(
+            epochs,
+            val_acc,
+            marker="s",
+            linestyle="--",
+            label=f"{METHOD_LABELS[method]} - Validation"
+        )
+
+        axes[1].plot(
+            epochs,
+            train_loss,
+            marker="o",
+            label=f"{METHOD_LABELS[method]} - Train"
+        )
+
+        axes[1].plot(
+            epochs,
+            val_loss,
+            marker="s",
+            linestyle="--",
+            label=f"{METHOD_LABELS[method]} - Validation"
+        )
+
+    axes[0].set_title(
+        f"{dataset_name}: Accuracy Comparison"
+    )
+
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("Accuracy (%)")
+    axes[0].grid(True)
+    axes[0].legend(fontsize=8)
+
+    axes[1].set_title(
+        f"{dataset_name}: Loss Comparison"
+    )
+
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("Loss")
+    axes[1].grid(True)
+    axes[1].legend(fontsize=8)
+
+    plt.tight_layout()
+
+    plt.savefig(
+        os.path.join(
+            RESULTS_DIR,
+            f"{dataset_name}_training_curves.png"
+        ),
+        dpi=200
+    )
+
+    plt.show()
+
+
+# ========================= 15. PERFORMANCE COMPARISON GRAPHS =========================
+
+metrics_to_plot = [
+
+    ("Test Accuracy (%)", "Classification Accuracy (%)"),
+
+    ("Training Time (minutes)", "Training Time (Minutes)"),
+
+    ("Peak GPU Memory Allocated (GB)", "Peak GPU Memory (GB)"),
+
+    ("Time to Target (seconds)", "Time to Target Accuracy (Seconds)")
+
+]
+
+for dataset_name in DATASETS_TO_RUN:
+
+    data = average_results[
+        average_results["Dataset"] == dataset_name
+    ]
+
+    for metric, title in metrics_to_plot:
+
+        plt.figure(figsize=(9, 5))
+
+        plt.bar(
+            data["Method"],
+            data[metric]
+        )
+
+        plt.title(
+            f"{dataset_name}: {title}"
+        )
+
+        plt.ylabel(title)
+
+        plt.xticks(
+            rotation=15,
+            ha="right"
+        )
+
+        plt.grid(
+            axis="y",
+            alpha=0.3
+        )
+
+        plt.tight_layout()
+
+        safe_metric = metric.replace(" ", "_").replace("(", "").replace(")", "").replace("%", "percent")
+
+        plt.savefig(
+            os.path.join(
+                RESULTS_DIR,
+                f"{dataset_name}_{safe_metric}.png"
+            ),
+            dpi=200
+        )
+
+        plt.show()
+
+
+# ========================= 16. AUTOMATIC PERFORMANCE SUMMARY =========================
+
+print("\n" + "=" * 75)
+print("AUTOMATIC EXPERIMENTAL OBSERVATIONS")
+print("=" * 75)
+
+for dataset_name in DATASETS_TO_RUN:
+
+    data = average_results[
+        average_results["Dataset"] == dataset_name
+    ].copy()
+
+    print("\nDATASET:", dataset_name)
+
+    for metric in [
+        "Test Accuracy (%)",
+        "Training Time (seconds)",
+        "Peak GPU Memory Allocated (GB)"
+    ]:
+
+        valid = data.dropna(subset=[metric])
+
+        if len(valid) == 0:
+            continue
+
+        if metric == "Test Accuracy (%)":
+
+            best = valid.loc[
+                valid[metric].idxmax()
+            ]
+
+            print(
+                f"Highest accuracy: {best['Method']} "
+                f"({best[metric]:.2f}%)"
+            )
+
+        else:
+
+            best = valid.loc[
+                valid[metric].idxmin()
+            ]
+
+            print(
+                f"Lowest {metric}: {best['Method']} "
+                f"({best[metric]:.4f})"
+            )
+
+    scratch = data[
+        data["Method"] == METHOD_LABELS["scratch"]
+    ]
+
+    transfer = data[
+        data["Method"] == METHOD_LABELS["feature_extraction"]
+    ]
+
+    if len(scratch) and len(transfer):
+
+        scratch_time = scratch[
+            "Training Time (seconds)"
+        ].iloc[0]
+
+        transfer_time = transfer[
+            "Training Time (seconds)"
+        ].iloc[0]
+
+        if scratch_time > 0:
+
+            reduction = (
+                (scratch_time - transfer_time)
+                / scratch_time
+            ) * 100
+
+            print(
+                f"Training-time change for transfer learning "
+                f"relative to scratch: {reduction:.2f}%"
+            )
+
+            if reduction > 0:
+                print("Transfer learning used less training time.")
+            else:
+                print("Transfer learning did not reduce measured training time.")
+
+print("\n" + "=" * 75)
+print("ALL EXPERIMENTS COMPLETED")
+print("=" * 75)
+
+
+# ========================= 17. SAVE EXPERIMENT CONFIGURATION =========================
+
+configuration = {
+
+    "Project": "Effect of Transfer Learning on Image Classification Training Efficiency",
+
+    "Model": MODEL_NAME,
+
+    "Datasets": DATASETS_TO_RUN,
+
+    "Training_Methods": METHODS,
+
+    "Epochs": EPOCHS,
+
+    "Batch_Size": BATCH_SIZE,
+
+    "Seeds": SEEDS,
+
+    "Image_Size": IMAGE_SIZE,
+
+    "Optimizer": "AdamW",
+
+    "Loss_Function": "CrossEntropyLoss",
+
+    "Scratch_Learning_Rate": SCRATCH_LR,
+
+    "Transfer_Head_Learning_Rate": HEAD_LR,
+
+    "Fine_Tuning_Backbone_Learning_Rate": BACKBONE_LR,
+
+    "Weight_Decay": WEIGHT_DECAY,
+
+    "Device": str(DEVICE),
+
+    "GPU": (
+        torch.cuda.get_device_name(0)
+        if torch.cuda.is_available()
+        else "CPU"
+    ),
+
+    "Mixed_Precision": USE_AMP,
+
+    "Target_Accuracy": TARGET_ACCURACY
+
+}
+
+with open(
+    os.path.join(RESULTS_DIR, "experiment_configuration.json"),
+    "w"
+) as f:
+
+    json.dump(
+        configuration,
+        f,
+        indent=4
+    )
+
+
+# ========================= 18. CREATE DOWNLOADABLE RESULTS =========================
+
+zip_path = "/content/transfer_learning_results.zip"
+
+with zipfile.ZipFile(
+    zip_path,
+    "w",
+    zipfile.ZIP_DEFLATED
+) as zipf:
+
+    for folder, subfolders, filenames in os.walk(RESULTS_DIR):
+
+        for filename in filenames:
+
+            file_path = os.path.join(
+                folder,
+                filename
+            )
+
+            archive_name = os.path.relpath(
+                file_path,
+                RESULTS_DIR
+            )
+
+            zipf.write(
+                file_path,
+                archive_name
+            )
+
+print("\nRESULTS SAVED SUCCESSFULLY")
+
+print("Results directory:", RESULTS_DIR)
+
+print("ZIP file:", zip_path)
+
+print("\nFiles generated:")
+
+for filename in sorted(os.listdir(RESULTS_DIR)):
+
+    print(" -", filename)
+
+if DOWNLOAD_RESULTS:
+
+    try:
+
+        from google.colab import files
+
+        files.download(zip_path)
+
+    except Exception:
+
+        print(
+            "Automatic download unavailable. "
+            "Download the ZIP from the Colab Files panel."
+        )
